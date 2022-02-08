@@ -36,6 +36,7 @@
 
 typedef enum EditorKey
 {
+    BACKSPACE = 127,
     ARROW_LEFT = UCHAR_MAX + 1,
     ARROW_RIGHT,
     ARROW_UP,
@@ -75,6 +76,7 @@ typedef struct Editor
     unsigned rowoff;
     unsigned coloff;
     unsigned numlines;
+    unsigned dirty;
     Line *lines;
     char *filename;
     char statusmsg[80];
@@ -83,6 +85,17 @@ typedef struct Editor
 } Editor;
 
 static Editor editor;
+
+
+//
+// prototypes
+//
+
+static void editorSetStatusMessage(const char *fmt, ...);
+
+static void editorRefreshScreen(void);
+
+static char *editorPrompt(char *prompt);
 
 
 //
@@ -372,7 +385,6 @@ buffer_free(Buffer *buffer)
 // row operations
 //
 
-
 static unsigned
 editorRowCxToRx(Line *line, unsigned cx)
 {
@@ -392,7 +404,11 @@ editorRowCxToRx(Line *line, unsigned cx)
 static void
 editorUpdateRow(Line *line)
 {
+    free(line->render.b);
+    line->render.b = 0;
+    line->render.len = 0;
     unsigned r = 0;
+
     for (unsigned i = 0; i < line->raw.len; ++i)
     {
         char c = line->raw.b[i];
@@ -415,29 +431,233 @@ editorUpdateRow(Line *line)
 
 
 static void
-editorAppendRow(Buffer *new)
+editorInsertRow(unsigned at, const char *s, unsigned len)
 {
-    Line *lines = realloc(editor.lines, sizeof(*lines) * (editor.numlines + 1));
-    if (!lines)
+    Line *new = realloc(editor.lines, sizeof(*new) * (editor.numlines + 1));
+    if (new)
     {
-        die("editorAppendRow");
+        editor.lines = new;
+        for (unsigned i = editor.numlines; i > at; --i)
+        {
+            editor.lines[i] = editor.lines[i - 1];
+        }
+
+        new = editor.lines + at;
+        if (len)
+        {
+            new->raw.b = malloc(len);
+            if (new->raw.b)
+            {
+                memcpy(new->raw.b, s, len);
+            }
+            else
+            {
+                die("editorInsertRow");
+            }
+        }
+        else
+        {
+            new->raw.b = 0;
+        }
+
+        new->raw.len = len;
+        new->render.len = 0;
+        new->render.b = 0;
+        ++editor.numlines;
+        ++editor.dirty;
+        editorUpdateRow(new);
+    }
+    else
+    {
+        die("editorInsertRow");
+    }
+}
+
+
+static void
+editorFreeRow(Line *line)
+{
+    free(line->raw.b);
+    free(line->render.b);
+}
+
+
+static void
+editorDelRow(unsigned at)
+{
+    if (at < editor.numlines)
+    {
+        editorFreeRow(editor.lines + at);
+        --editor.numlines;
+        while (at < editor.numlines)
+        {
+            editor.lines[at] = editor.lines[at + 1];
+            ++at;
+        }
+        ++editor.dirty;
+    }
+}
+
+
+static void
+editorRowInsertChar(Line *line, unsigned at, int c)
+{
+    if (at > line->raw.len)
+    {
+        at = line->raw.len;
     }
 
-    editor.lines = lines;
-    Line *line = editor.lines + editor.numlines++;
-    line->raw = *new;
-    line->render.len = 0;
-    line->render.b = 0;
-    editorUpdateRow(line);
+    char *new = realloc(line->raw.b, line->raw.len + 1);
+    if (new)
+    {
+        line->raw.b = new;
+        for (unsigned i = line->raw.len; i > at; --i)
+        {
+            line->raw.b[i] = line->raw.b[i - 1];
+        }
+        ++line->raw.len;
+        line->raw.b[at] = CAST(char)c;
+        ++editor.dirty;
+        editorUpdateRow(line);
+    }
+    else
+    {
+        die("editorRowInsertChar");
+    }
+}
 
-    new->len = 0;
-    new->b = 0;
+
+static void
+editorRowAppendString(Line *line, char *s, unsigned len)
+{
+    char *new = line->raw.b;
+    unsigned size = line->raw.len + len;
+    if (size > line->raw.len)
+    {
+        new = realloc(line->raw.b, size);
+        if (new)
+        {
+            for (size_t i = 0; i < len; ++i)
+            {
+                new[line->raw.len + i] = s[i];
+            }
+        }
+        else
+        {
+            die("editorRowAppendString");
+        }
+    }
+
+    line->raw.b = new;
+    line->raw.len = size;
+    ++editor.dirty;
+    editorUpdateRow(line);
+}
+
+
+static void
+editorRowDelChar(Line *line, unsigned at)
+{
+    if (at < line->raw.len)
+    {
+        --line->raw.len;
+        while (at < line->raw.len)
+        {
+            line->raw.b[at] = line->raw.b[at + 1];
+            ++at;
+        }
+        editorUpdateRow(line);
+        ++editor.dirty;
+    }
+}
+
+
+//
+// editor operations
+//
+
+static void
+editorInsertChar(int c)
+{
+    if (editor.cy == editor.numlines)
+    {
+        editorInsertRow(editor.cy, 0, 0);
+    }
+    editorRowInsertChar(editor.lines + editor.cy, editor.cx, c);
+    ++editor.cx;
+}
+
+
+static void
+editorInsertNewline(void)
+{
+    if (editor.cx)
+    {
+        Line *line = editor.lines + editor.cy;
+        editorInsertRow(editor.cy + 1, line->raw.b + editor.cx, line->raw.len - editor.cx);
+
+        // NOTE: editorInsertRow reallocs editor.lines, which means line is now invalid
+        line = editor.lines + editor.cy;
+        line->raw.len = editor.cx;
+        editorUpdateRow(line);
+        editor.cx = 0;
+    }
+    else
+    {
+        editorInsertRow(editor.cy, 0, 0);
+    }
+    ++editor.cy;
+}
+
+
+static void
+editorDelChar(void)
+{
+    if (editor.cy < editor.numlines)
+    {
+        Line *line = editor.lines + editor.cy;
+        if (editor.cx)
+        {
+            editorRowDelChar(line, --editor.cx);
+        }
+        else if (editor.cy)
+        {
+            --editor.cy;
+            editor.cx = editor.lines[editor.cy].raw.len;
+            editorRowAppendString(editor.lines + editor.cy, line->raw.b, line->raw.len);
+            editorDelRow(editor.cy + 1);
+        }
+    }
 }
 
 
 //
 // file i/o
 //
+
+
+static char *
+editorRowsToString(unsigned *buflen)
+{
+    unsigned totlen = 0;
+    for (unsigned j = 0; j < editor.numlines; ++j)
+    {
+        totlen += editor.lines[j].raw.len + 1;
+    }
+    *buflen = totlen;
+
+    char *buf = malloc(totlen);
+    char *p = buf;
+    for (unsigned j = 0; j < editor.numlines; ++j)
+    {
+        memcpy(p, editor.lines[j].raw.b, editor.lines[j].raw.len);
+        p += editor.lines[j].raw.len;
+        *p = '\n';
+        ++p;
+    }
+
+    return buf;
+}
 
 
 static void
@@ -495,15 +715,126 @@ editorOpen(const char *filename)
             {
                 --line.len;
             }
-            editorAppendRow(&line);
+            editorInsertRow(editor.numlines, line.b, line.len);
         }
     } while (nread);
+
+    editor.dirty = 0;
+}
+
+
+static void
+editorSave(void)
+{
+    if (!editor.filename)
+    {
+        editor.filename = editorPrompt("Save as: %s");
+        if (!editor.filename)
+        {
+            editorSetStatusMessage("Save aborted");
+            return;
+        }
+    }
+
+    int fd = open(editor.filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (-1 == fd)
+    {
+        editorSetStatusMessage("Can't save! I/O error: %s", strerror(errno));
+    }
+    else
+    {
+        unsigned len;
+        char *buf = editorRowsToString(&len);
+
+        while (len)
+        {
+            ssize_t written = write(fd, buf, len);
+            if (-1 == written)
+            {
+                editorSetStatusMessage("Error while saving: %s", strerror(errno));
+                break;
+            }
+            else
+            {
+                len -= CAST(unsigned)written;
+            }
+        }
+        close(fd);
+        free(buf);
+        editor.dirty = len;
+    }
+}
+
+
+static void
+editorSetStatusMessage(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(editor.statusmsg, sizeof(editor.statusmsg), fmt, args);
+    va_end(args);
+    editor.statusmsg_time = time(0);
 }
 
 
 //
 // input
 //
+
+
+static char *
+editorPrompt(char *prompt)
+{
+    size_t bufsize = 128;
+    char *buf = malloc (bufsize);
+
+    size_t buflen = 0;
+    buf[0] = 0;
+
+    for (;;)
+    {
+        editorSetStatusMessage(prompt, buf);
+        editorRefreshScreen();
+
+        int c = terminalReadKey();
+        if ((DEL_KEY == c) || (CTRL_KEY('h') == c) || (BACKSPACE == c))
+        {
+            if (buflen)
+            {
+                buf[--buflen] = 0;
+            }
+        }
+        else if ('\x1b' == c)
+        {
+            editorSetStatusMessage("");
+            free(buf);
+            buf = 0;
+            break;
+        }
+        else if ('\r' == c)
+        {
+            if (buflen)
+            {
+                editorSetStatusMessage("");
+                break;
+            }
+        }
+        else if ((c > 31) && (c < 127))
+        {
+            if ((buflen + 1) == bufsize)
+            {
+                bufsize *= 2;
+                buf = realloc(buf, bufsize);
+            }
+
+            buf[buflen++] = CAST(char)c;
+            buf[buflen] = 0;
+        }
+    }
+
+    return buf;
+}
+
 
 static void
 editorMoveCursor(int key)
@@ -537,7 +868,7 @@ editorMoveCursor(int key)
                 {
                     ++editor.cx;
                 }
-                else if (editor.cy < editor.numlines)
+                else if ((editor.cy + 1) < editor.numlines)
                 {
                     ++editor.cy;
                     editor.cx = 0;
@@ -547,7 +878,7 @@ editorMoveCursor(int key)
 
         case ARROW_DOWN:
         {
-            if (editor.cy < editor.numlines)
+            if ((editor.cy + 1) < editor.numlines)
             {
                 ++editor.cy;
             }
@@ -580,53 +911,124 @@ editorMoveCursor(int key)
 static void
 editorProcessKeyPress(void)
 {
+    static int confirm_quit = 0;
     int c = terminalReadKey();
 
-    switch (c)
+    if (confirm_quit)
     {
-        case CTRL_KEY('q'):
+        switch (c)
         {
-            write(STDOUT_FILENO, "\x1b[2J", 4);
-            write(STDOUT_FILENO, "\x1b[H", 3);
-            exit(EXIT_SUCCESS);
-        } break;
-
-        case ARROW_UP:
-        case ARROW_DOWN:
-        case ARROW_LEFT:
-        case ARROW_RIGHT:
-        {
-            editorMoveCursor(c);
-        } break;
-
-        case END_KEY:
-        {
-            if (editor.cy < editor.numlines)
+            case 'y':
+            case 'Y':
             {
-                editor.cx = editor.lines[editor.cy].raw.len;
-            }
-        } break;
+                write(STDOUT_FILENO, "\x1b[2J", 4);
+                write(STDOUT_FILENO, "\x1b[H", 3);
+                exit(EXIT_SUCCESS);
+            } break;
 
-        case HOME_KEY:
-        {
-            editor.cx = 0;
-        } break;
-
-        case PAGE_DOWN:
-        {
-            for (unsigned n = 1; n < editor.screenrows; ++n)
+            case 'n':
+            case 'N':
+            case '\r':
             {
-                editorMoveCursor(ARROW_DOWN);
-            }
-        } break;
+                confirm_quit = 0;
+                editorSetStatusMessage("");
+            } break;
 
-        case PAGE_UP:
-        {
-            for (unsigned n = 1; n < editor.screenrows; ++n)
+            default:
             {
-                editorMoveCursor(ARROW_UP);
-            }
-        } break;
+                editorSetStatusMessage(
+                    "WARNING!!! File has unsaved changes. Are you sure you want to quit? (y/N)");
+            } break;
+        }
+    }
+    else
+    {
+        switch (c)
+        {
+            case '\r':
+            {
+                editorInsertNewline();
+            } break;
+
+            case CTRL_KEY('q'):
+            {
+                if (!editor.dirty || confirm_quit)
+                {
+                    write(STDOUT_FILENO, "\x1b[2J", 4);
+                    write(STDOUT_FILENO, "\x1b[H", 3);
+                    exit(EXIT_SUCCESS);
+                }
+                else
+                {
+                    confirm_quit = 1;
+                    editorSetStatusMessage(
+                        "WARNING!!! File has unsaved changes. Are you sure you want to quit? (y/N)");
+                }
+            } break;
+
+            case CTRL_KEY('s'):
+            {
+                editorSave();
+            } break;
+
+            case ARROW_UP:
+            case ARROW_DOWN:
+            case ARROW_LEFT:
+            case ARROW_RIGHT:
+            {
+                editorMoveCursor(c);
+            } break;
+
+            case BACKSPACE:
+            case CTRL_KEY('h'):
+            case DEL_KEY:
+            {
+                if (DEL_KEY == c)
+                {
+                    editorMoveCursor(ARROW_RIGHT);
+                }
+                editorDelChar();
+            } break;
+
+            case END_KEY:
+            {
+                if (editor.cy < editor.numlines)
+                {
+                    editor.cx = editor.lines[editor.cy].raw.len;
+                }
+            } break;
+
+            case HOME_KEY:
+            {
+                editor.cx = 0;
+            } break;
+
+            case PAGE_DOWN:
+            {
+                for (unsigned n = 1; n < editor.screenrows; ++n)
+                {
+                    editorMoveCursor(ARROW_DOWN);
+                }
+            } break;
+
+            case PAGE_UP:
+            {
+                for (unsigned n = 1; n < editor.screenrows; ++n)
+                {
+                    editorMoveCursor(ARROW_UP);
+                }
+            } break;
+
+            case CTRL_KEY('l'):
+            case '\x1b':
+            {
+            } break;
+
+            default:
+            {
+                editorInsertChar(c);
+            } break;
+        }
     }
 }
 
@@ -736,8 +1138,12 @@ editorDrawStatusBar(Buffer *buffer)
 {
     buffer_append(buffer, "\x1b[7m", 4);
     char status[80];
-    int result = snprintf(status, sizeof(status), "%.20s - %u lines",
-        editor.filename ? editor.filename : "[No Name]", editor.numlines);
+    int result = snprintf(
+        status, sizeof(status),
+        "%.20s - %u lines%s",
+        editor.filename ? editor.filename : "[No Name]",
+        editor.numlines,
+        editor.dirty ? " (modified)" : "");
     if (result < 0)
     {
         die("status bar");
@@ -821,17 +1227,6 @@ editorRefreshScreen(void)
 }
 
 
-static void
-editorSetStatusMessage(const char *fmt, ...)
-{
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(editor.statusmsg, sizeof(editor.statusmsg), fmt, args);
-    va_end(args);
-    editor.statusmsg_time = time(0);
-}
-
-
 //
 // init
 //
@@ -845,6 +1240,7 @@ initEditor(void)
     editor.rowoff = 0;
     editor.coloff = 0;
     editor.numlines = 0;
+    editor.dirty = 0;
     editor.lines = 0;
     editor.filename = 0;
     editor.statusmsg[0] = 0;
@@ -864,7 +1260,7 @@ int main(int argc, char **argv)
     {
         editorOpen(argv[1]);
     }
-    editorSetStatusMessage("Help: Ctrl-Q = quit");
+    editorSetStatusMessage("Help: Ctrl-s = save | Ctrl-Q = quit");
 
     enableRawMode();
     for (;;)
