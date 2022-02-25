@@ -11,7 +11,7 @@
 #include <stdarg.h>
 #include <stdio.h> // perror, printf, snprintf
 #include <stdlib.h> // atexit, exit, free, malloc, realloc, EXIT_SUCCESS
-#include <string.h> // memcpy, strlen
+#include <string.h> // memcpy, strlen, strstr
 #include <sys/ioctl.h> // struct winsize, ioctl, TIOCGWINSZ
 #include <termios.h> // struct termios, tcgetattr, tcsetattr, BRKINT, CS8, ECHO, ICANON,
                      // ICRNL, IEXTEN, INPCK, ISIG, ISTRIP, IXON, OPOST, TCSAFLUSH, VMIN,
@@ -95,7 +95,8 @@ static void editorSetStatusMessage(const char *fmt, ...);
 
 static void editorRefreshScreen(void);
 
-static char *editorPrompt(char *prompt);
+typedef void PromptCallback(char *, int);
+static char *editorPrompt(char *prompt, PromptCallback callback);
 
 
 //
@@ -345,7 +346,6 @@ getWindowSize(unsigned *rows, unsigned *cols)
 // string buffer
 //
 
-
 static void
 buffer_init(Buffer *buffer)
 {
@@ -360,13 +360,14 @@ buffer_append(Buffer *buffer, const char *s, unsigned len)
     if (len)
     {
         assert((buffer->len + len) > buffer->len);
-        char *new = realloc(buffer->b, buffer->len + len);
+        char *new = realloc(buffer->b, buffer->len + len + 1);
 
         if (new)
         {
             memcpy(new + buffer->len, s, len);
             buffer->b = new;
             buffer->len += len;
+            buffer->b[buffer->len] = 0;
         }
     }
 }
@@ -393,13 +394,38 @@ editorRowCxToRx(Line *line, unsigned cx)
     {
         if ('\t' == line->raw.b[i])
         {
-            rx += (KILO_TAB_STOP - 1) - (rx & KILO_TAB_STOP);
+            rx += (KILO_TAB_STOP - 1) - (rx % KILO_TAB_STOP);
         }
         ++rx;
     }
 
     return rx;
 }
+
+
+static unsigned
+editorRowRxToCx(Line *line, unsigned rx)
+{
+    unsigned current_rx = 0;
+    unsigned cx;
+    for (cx = 0; cx < line->raw.len; ++cx)
+    {
+        if ('\t' == line->raw.b[cx])
+        {
+            current_rx += (KILO_TAB_STOP - 1) - (current_rx % KILO_TAB_STOP);
+        }
+        ++current_rx;
+
+        if (current_rx > rx)
+        {
+            break;
+        }
+    }
+
+
+    return cx;
+}
+
 
 static void
 editorUpdateRow(Line *line)
@@ -445,10 +471,11 @@ editorInsertRow(unsigned at, const char *s, unsigned len)
         new = editor.lines + at;
         if (len)
         {
-            new->raw.b = malloc(len);
+            new->raw.b = malloc(len + 1);
             if (new->raw.b)
             {
                 memcpy(new->raw.b, s, len);
+                new->raw.b[len] = 0;
             }
             else
             {
@@ -517,6 +544,7 @@ editorRowInsertChar(Line *line, unsigned at, int c)
         }
         ++line->raw.len;
         line->raw.b[at] = CAST(char)c;
+        line->raw.b[line->raw.len] = 0;
         ++editor.dirty;
         editorUpdateRow(line);
     }
@@ -561,7 +589,7 @@ editorRowDelChar(Line *line, unsigned at)
     if (at < line->raw.len)
     {
         --line->raw.len;
-        while (at < line->raw.len)
+        while (at <= line->raw.len)
         {
             line->raw.b[at] = line->raw.b[at + 1];
             ++at;
@@ -599,6 +627,7 @@ editorInsertNewline(void)
         // NOTE: editorInsertRow reallocs editor.lines, which means line is now invalid
         line = editor.lines + editor.cy;
         line->raw.len = editor.cx;
+        line->raw.b[line->raw.len] = 0;
         editorUpdateRow(line);
         editor.cx = 0;
     }
@@ -634,7 +663,6 @@ editorDelChar(void)
 //
 // file i/o
 //
-
 
 static char *
 editorRowsToString(unsigned *buflen)
@@ -728,7 +756,7 @@ editorSave(void)
 {
     if (!editor.filename)
     {
-        editor.filename = editorPrompt("Save as: %s");
+        editor.filename = editorPrompt("Save as: %s", 0);
         if (!editor.filename)
         {
             editorSetStatusMessage("Save aborted");
@@ -766,14 +794,98 @@ editorSave(void)
 }
 
 
+//
+// find
+//
+
 static void
-editorSetStatusMessage(const char *fmt, ...)
+editorFindCallback(char *query, int key)
 {
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(editor.statusmsg, sizeof(editor.statusmsg), fmt, args);
-    va_end(args);
-    editor.statusmsg_time = time(0);
+    static unsigned last_match = CAST(unsigned)-1;
+    static int direction = 1;
+
+    switch (key)
+    {
+        case '\r':
+        case '\x1b':
+        {
+            last_match = CAST(unsigned)-1;
+            direction = 1;
+            return;
+        } break;
+
+        case ARROW_RIGHT:
+        case ARROW_DOWN:
+        {
+            direction = 1;
+        } break;
+
+        case ARROW_LEFT:
+        case ARROW_UP:
+        {
+            direction = -1;
+        } break;
+
+        default:
+        {
+            last_match = CAST(unsigned)-1;
+            direction = 1;
+        }
+    }
+
+    unsigned current = last_match;
+    for (unsigned i = 0; i < editor.numlines; ++i)
+    {
+        current += CAST(unsigned)direction;
+        if (current >= editor.numlines)
+        {
+            if (1 == direction)
+            {
+                current = 0;
+            }
+            else
+            {
+                current = editor.numlines - 1;
+            }
+        }
+
+        Line *line = editor.lines + current;
+        if (line->render.len)
+        {
+            char *match = strstr(line->render.b, query);
+            if (match)
+            {
+                last_match = current;
+                editor.cy = current;
+                editor.cx = editorRowRxToCx(line, CAST(unsigned)(match - line->render.b));
+                editor.rowoff = editor.numlines;
+                break;
+            }
+        }
+    }
+}
+
+
+static void
+editorFind(void)
+{
+    unsigned cx = editor.cx;
+    unsigned cy = editor.cy;
+    unsigned coloff = editor.coloff;
+    unsigned rowoff = editor.rowoff;
+
+    char *query = editorPrompt("Search: %s (Use ESC/Arrows/Enter)", editorFindCallback);
+    if (query)
+    {
+        free(query);
+    }
+    else
+    {
+        editor.cx = cx;
+        editor.cy = cy;
+        editor.coloff = coloff;
+        editor.rowoff = rowoff;
+    }
 }
 
 
@@ -781,12 +893,11 @@ editorSetStatusMessage(const char *fmt, ...)
 // input
 //
 
-
 static char *
-editorPrompt(char *prompt)
+editorPrompt(char *prompt, PromptCallback callback)
 {
     size_t bufsize = 128;
-    char *buf = malloc (bufsize);
+    char *buf = malloc(bufsize);
 
     size_t buflen = 0;
     buf[0] = 0;
@@ -807,6 +918,10 @@ editorPrompt(char *prompt)
         else if ('\x1b' == c)
         {
             editorSetStatusMessage("");
+            if (callback)
+            {
+                callback(buf, c);
+            }
             free(buf);
             buf = 0;
             break;
@@ -816,6 +931,10 @@ editorPrompt(char *prompt)
             if (buflen)
             {
                 editorSetStatusMessage("");
+                if (callback)
+                {
+                    callback(buf, c);
+                }
                 break;
             }
         }
@@ -829,6 +948,11 @@ editorPrompt(char *prompt)
 
             buf[buflen++] = CAST(char)c;
             buf[buflen] = 0;
+        }
+
+        if (callback)
+        {
+            callback(buf, c);
         }
     }
 
@@ -950,6 +1074,11 @@ editorProcessKeyPress(void)
                 editorInsertNewline();
             } break;
 
+            case CTRL_KEY('f'):
+            {
+                editorFind();
+            } break;
+
             case CTRL_KEY('q'):
             {
                 if (!editor.dirty || confirm_quit)
@@ -1036,7 +1165,6 @@ editorProcessKeyPress(void)
 //
 // output
 //
-
 
 void editorScroll(void)
 {
@@ -1227,6 +1355,17 @@ editorRefreshScreen(void)
 }
 
 
+static void
+editorSetStatusMessage(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(editor.statusmsg, sizeof(editor.statusmsg), fmt, args);
+    va_end(args);
+    editor.statusmsg_time = time(0);
+}
+
+
 //
 // init
 //
@@ -1260,7 +1399,7 @@ int main(int argc, char **argv)
     {
         editorOpen(argv[1]);
     }
-    editorSetStatusMessage("Help: Ctrl-s = save | Ctrl-Q = quit");
+    editorSetStatusMessage("Help: Ctrl-s = save | Ctrl-Q = quit | Ctrl-F = find");
 
     enableRawMode();
     for (;;)

@@ -7,7 +7,7 @@ EXE_LIBS=
 
 # Things that could also be modified but are probably fine
 BUILD_DIR=../build/
-CC=cc
+CC=clang
 C_VERSION=gnu17
 COMPILER_FLAGS+="-g "
 #COMPILER_FLAGS+="-O3 "
